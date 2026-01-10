@@ -1,0 +1,20 @@
+# --- WordPress / Server ---
+wp-config.php
+.htaccess
+
+# --- Logs / Debug ---
+debug.log
+error.log
+*.log
+
+# --- OS / Editor ---
+.DS_Store
+Thumbs.db
+.vscode/
+
+# --- Secrets ---
+.env
+.env.*
+
+# --- Deployment helper (optional, falls lokal) ---
+deploy-plugin.ps1
