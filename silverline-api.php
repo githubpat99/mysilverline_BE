@@ -175,10 +175,30 @@ function sl_profile_v2_get(WP_REST_Request $req) {
     'instruments'  => [],
     'annuals'      => ['income' => [], 'need' => []], // indexation is optional
     'events'       => [],
-    'meta'         => ['startYear' => $year],
+    'meta'         => [
+      'startYear' => $year,
+      // default only; if DB has value -> overwritten below
+      'forecastHorizonYears' => 55,
+    ],
   ];
 
   if ($has_basic) {
+    // --- load horizon from DB (if column exists)
+    // If your table might not yet have the column in all envs, guard it:
+    $cols = $wpdb->get_col("SHOW COLUMNS FROM {$t_basic}", 0);
+    $has_horizon_col = is_array($cols) && in_array('forecast_horizon_years', $cols, true);
+
+    if ($has_horizon_col) {
+      $row = $wpdb->get_row(
+        $wpdb->prepare("SELECT forecast_horizon_years FROM {$t_basic} WHERE user_id=%d LIMIT 1", $uid),
+        ARRAY_A
+      );
+      if ($row && array_key_exists('forecast_horizon_years', $row) && $row['forecast_horizon_years'] !== null) {
+        $h = sl_sanitize_horizon_years($row['forecast_horizon_years']);
+        if ($h !== null) $profile['meta']['forecastHorizonYears'] = $h;
+      }
+    }
+
     $profile['household'] = sl_basic_load_household($uid, $t_basic);
 
     // annuals includes optional indexation, sourced from sl_finance_basic.annuals_indexation
@@ -215,8 +235,8 @@ function sl_profile_v2_get(WP_REST_Request $req) {
 function sl_profile_v2_post(WP_REST_Request $req) {
   global $wpdb;
 
-  $uid    = (int)get_current_user_id();
-  $body   = json_decode($req->get_body(), true);
+  $uid     = (int)get_current_user_id();
+  $body    = json_decode($req->get_body(), true);
   $profile = $body['profile'] ?? null;
 
   if (!$profile || !is_array($profile)) {
@@ -235,12 +255,32 @@ function sl_profile_v2_post(WP_REST_Request $req) {
 
   $now = current_time('mysql', 1);
 
+  // --- sanitize meta horizon (NO business rule like min=10; only safety)
+  $meta = is_array($profile['meta'] ?? null) ? $profile['meta'] : [];
+  $h = sl_sanitize_horizon_years($meta['forecastHorizonYears'] ?? null);
+
   $wpdb->query('START TRANSACTION');
 
   try {
     if ($has_basic) {
+      // Write basic + annuals
       sl_write_basic_from_profile_v2($uid, $profile, $t_basic, $now);
       sl_write_annuals_from_profile_v2($uid, $profile, $t_basic, $now);
+
+      // Persist horizon if column exists (and keep it optional for older DBs)
+      $cols = $wpdb->get_col("SHOW COLUMNS FROM {$t_basic}", 0);
+      $has_horizon_col = is_array($cols) && in_array('forecast_horizon_years', $cols, true);
+
+      if ($has_horizon_col) {
+        // store NULL if not set; otherwise store sanitized int
+        $wpdb->update(
+          $t_basic,
+          ['forecast_horizon_years' => $h],
+          ['user_id' => $uid],
+          ['%d'],
+          ['%d']
+        );
+      }
     }
 
     if ($has_pos) {
@@ -900,4 +940,12 @@ function sl_table_exists($table_name) {
   $sql = $wpdb->prepare("SHOW TABLES LIKE %s", $like);
   $found = $wpdb->get_var($sql);
   return !empty($found);
+}
+
+function sl_sanitize_horizon_years($v) {
+  if (!isset($v)) return null;
+  $n = (int)$v;
+  if ($n <= 0) return null;
+  if ($n > 120) $n = 120; // safety only
+  return $n;
 }
