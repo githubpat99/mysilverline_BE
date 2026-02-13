@@ -1,29 +1,23 @@
 <?php
 /**
  * Plugin Name: Silverline API
- * Description: Silverline REST API endpoints (whoami, nonce, profile-v2)
- * Version: 0.2.1
+ * Description: Silverline REST API endpoints (whoami, nonce, profile-v2; relational persistence)
+ * Version: 0.3.3
  *
- * Silverline API (ProfileV2 transport-only JSON; relational persistence)
  * Namespace: silverline/v1
  *
  * Contract:
  * - GET  /wp-json/silverline/v1/profile-v2  -> { ok:true, profile: ProfileV2 }
- * - POST /wp-json/silverline/v1/profile-v2  -> { ok:true, profile: ProfileV2 } (freshly loaded, incl. DB ids)
+ * - POST /wp-json/silverline/v1/profile-v2 -> { ok:true, profile: ProfileV2 } (freshly loaded)
  *
- * Persistence (relational SoT):
- * - wp_XXXX_sl_finance_basic  (optional; stores basic household/self data if exists)
- * - wp_XXXX_sl_position       (optional; stores instruments if exists)
- * - wp_XXXX_sl_event          (optional; stores events header if exists)
- * - wp_XXXX_sl_event_line     (optional; stores 1 line per event if exists)
+ * New endpoints (relational, no JSON SoT):
+ * - GET  /wp-json/silverline/v1/positions
+ * - POST /wp-json/silverline/v1/positions/replace
+ * - POST /wp-json/silverline/v1/position-targets/set
+ * - GET  /wp-json/silverline/v1/profile-events
+ * - POST /wp-json/silverline/v1/profile-events/replace
  *
- * Notes:
- * - This file does NOT persist JSON blobs as source of truth.
- * - Parts of ProfileV2 that do not have relational tables yet will be returned with defaults (empty arrays/objects).
- *
- * IMPORTANT (Indexation):
- * - annuals.indexation is persisted ONLY in sl_finance_basic.annuals_indexation
- * - NO meta_load / meta annualsIndexation mapping anymore.
+ * Token-Auth (PWA): GET /auth-token für X-SL-Auth-Token Fallback
  */
 
 // ------------------------------
@@ -37,21 +31,31 @@ add_action('rest_api_init', function () {
     'permission_callback' => '__return_true',
   ]);
 
-  // Public: cookie-only identity check
   register_rest_route('silverline/v1', '/whoami', [
     'methods'  => 'GET',
     'callback' => 'sl_whoami',
     'permission_callback' => '__return_true',
   ]);
 
-  // Public: fetch nonce
   register_rest_route('silverline/v1', '/nonce', [
     'methods'  => 'GET',
     'callback' => 'sl_nonce',
     'permission_callback' => '__return_true',
   ]);
 
-  // ProfileV2 (transport contract)
+  register_rest_route('silverline/v1', '/auth-token', [
+    'methods'  => 'GET',
+    'callback' => 'sl_auth_token',
+    'permission_callback' => 'sl_perm_logged_in_cookie_only',
+  ]);
+
+  register_rest_route('silverline/v1', '/logout', [
+    'methods'  => 'POST',
+    'callback' => 'sl_logout',
+    'permission_callback' => 'sl_perm_logged_in_cookie_only',
+  ]);
+
+  // ProfileV2 transport
   register_rest_route('silverline/v1', '/profile-v2', [
     'methods'  => 'GET',
     'callback' => 'sl_profile_v2_get',
@@ -64,52 +68,188 @@ add_action('rest_api_init', function () {
     'permission_callback' => 'sl_perm_logged_in_and_nonce',
   ]);
 
-  // Logout (optional)
-  register_rest_route('silverline/v1', '/logout', [
-    'methods'  => 'POST',
-    'callback' => 'sl_logout',
+  // New: Positions
+  register_rest_route('silverline/v1', '/positions', [
+    'methods'  => 'GET',
+    'callback' => 'sl_positions_get',
     'permission_callback' => 'sl_perm_logged_in_cookie_only',
+  ]);
+
+  register_rest_route('silverline/v1', '/positions/replace', [
+    'methods'  => 'POST',
+    'callback' => 'sl_positions_replace_post',
+    'permission_callback' => 'sl_perm_logged_in_and_nonce',
+  ]);
+
+  // New: Position targets
+  register_rest_route('silverline/v1', '/position-targets/set', [
+    'methods'  => 'POST',
+    'callback' => 'sl_position_targets_set_post',
+    'permission_callback' => 'sl_perm_logged_in_and_nonce',
+  ]);
+
+  // New: ProfileEvents
+  register_rest_route('silverline/v1', '/profile-events', [
+    'methods'  => 'GET',
+    'callback' => 'sl_profile_events_get',
+    'permission_callback' => 'sl_perm_logged_in_cookie_only',
+  ]);
+
+  register_rest_route('silverline/v1', '/profile-events/replace', [
+    'methods'  => 'POST',
+    'callback' => 'sl_profile_events_replace_post',
+    'permission_callback' => 'sl_perm_logged_in_and_nonce',
   ]);
 });
 
+// CORS: X-SL-Auth-Token für PWA (insbesondere Android) erlauben
+add_filter('rest_allowed_cors_headers', function ($headers) {
+  $headers[] = 'X-SL-Auth-Token';
+  $headers[] = 'X-WP-Nonce';
+  return $headers;
+}, 10, 1);
+
+// Login-Redirect: Nach Anmeldung direkt in die Finanz-App
+add_filter('login_redirect', function ($redirect_to, $requested_redirect_to, $user) {
+  if (is_wp_error($user) || !$user) return $redirect_to;
+  if (!empty($requested_redirect_to)) return $requested_redirect_to;
+  return home_url('/app-static/finance');
+}, 10, 3);
+
 // ------------------------------
-// Auth helpers
+// Auth helpers (Cookie + Token für PWA)
 // ------------------------------
 
-function sl_ensure_current_user_from_cookie() {
-  // In REST context WP sometimes has user_id=0 even with valid cookies.
-  // Force-validate logged_in cookie.
+define('SL_AUTH_TOKEN_META_KEY', 'sl_auth_token');
+define('SL_AUTH_TOKEN_EXPIRY_META_KEY', 'sl_auth_token_expiry');
+define('SL_AUTH_TOKEN_TTL_DAYS', 7);
+define('SL_AUTH_TOKEN_HEADER', 'x-sl-auth-token');
+
+function sl_get_token_from_request(WP_REST_Request $req) {
+  $h = $req->get_header(SL_AUTH_TOKEN_HEADER);
+  if (is_string($h) && trim($h) !== '') return trim($h);
+  $auth = $req->get_header('authorization');
+  if (is_string($auth) && preg_match('/^Bearer\s+(\S+)$/i', $auth, $m)) return trim($m[1]);
+  return null;
+}
+
+function sl_validate_auth_token($token) {
+  if (empty($token) || !is_string($token)) return 0;
+  global $wpdb;
+  $meta = $wpdb->get_results($wpdb->prepare(
+    "SELECT user_id, meta_value FROM {$wpdb->usermeta} WHERE meta_key = %s AND meta_value = %s LIMIT 1",
+    SL_AUTH_TOKEN_META_KEY,
+    $token
+  ), ARRAY_A);
+  if (empty($meta)) return 0;
+  $uid = (int)($meta[0]['user_id'] ?? 0);
+  if ($uid <= 0) return 0;
+  $expiry = get_user_meta($uid, SL_AUTH_TOKEN_EXPIRY_META_KEY, true);
+  if (empty($expiry) || (int)$expiry < time()) return 0;
+  return $uid;
+}
+
+function sl_ensure_current_user_from_cookie_or_token(WP_REST_Request $req) {
   if (is_user_logged_in()) return;
-
+  $token = sl_get_token_from_request($req);
+  if ($token) {
+    $uid = sl_validate_auth_token($token);
+    if ($uid) {
+      wp_set_current_user($uid);
+      return;
+    }
+  }
   if (empty($_COOKIE[LOGGED_IN_COOKIE])) return;
-
   $cookie  = wp_unslash($_COOKIE[LOGGED_IN_COOKIE]);
   $user_id = wp_validate_auth_cookie($cookie, 'logged_in');
-  if ($user_id) {
-    wp_set_current_user($user_id);
-  }
+  if ($user_id) wp_set_current_user($user_id);
+}
+
+function sl_create_auth_token($user_id) {
+  $token = bin2hex(random_bytes(24));
+  $expiry = time() + (SL_AUTH_TOKEN_TTL_DAYS * DAY_IN_SECONDS);
+  update_user_meta($user_id, SL_AUTH_TOKEN_META_KEY, $token);
+  update_user_meta($user_id, SL_AUTH_TOKEN_EXPIRY_META_KEY, $expiry);
+  return ['token' => $token, 'expires_at' => $expiry, 'expires_in' => SL_AUTH_TOKEN_TTL_DAYS * DAY_IN_SECONDS];
 }
 
 function sl_perm_logged_in_cookie_only(WP_REST_Request $req) {
-  if (get_current_user_id() === 0) sl_ensure_current_user_from_cookie();
+  if (get_current_user_id() === 0) sl_ensure_current_user_from_cookie_or_token($req);
   return (get_current_user_id() > 0);
 }
 
 function sl_perm_logged_in_and_nonce(WP_REST_Request $req) {
   if (!sl_perm_logged_in_cookie_only($req)) return false;
-
+  // Bei Token-Auth: wp_verify_nonce scheitert (keine Cookie-Session).
+  $token = sl_get_token_from_request($req);
+  if ($token && sl_validate_auth_token($token) > 0) return true;
+  // Cookie-Auth: Nonce erforderlich
   $nonce = $req->get_header('x-wp-nonce');
   if (!$nonce) return false;
-
   return wp_verify_nonce($nonce, 'wp_rest') === 1;
 }
 
+/**
+ * determine_current_user: Bei gültigem Token User setzen, bevor Cookie-Check läuft.
+ * Entfernt rest_cookie_collect_status, damit rest_cookie_check_errors den Nonce-Skip nutzt.
+ */
+add_filter('determine_current_user', function ($user_id) {
+  $token = sl_get_token_from_server();
+  if (!$token) return $user_id;
+  $uid = sl_validate_auth_token($token);
+  if ($uid <= 0) return $user_id;
+  remove_action('auth_cookie_valid', 'rest_cookie_collect_status');
+  return $uid;
+}, 5);
+
+/**
+ * Holt Token aus Request-Headern (verschiedene Server-Setups).
+ */
+function sl_get_token_from_server(): ?string {
+  if (function_exists('getallheaders')) {
+    $h = getallheaders();
+    if (is_array($h)) {
+      $h = array_change_key_case($h, CASE_LOWER);
+      if (!empty($h['x-sl-auth-token'])) return trim((string) $h['x-sl-auth-token']);
+    }
+  }
+  $keys = ['HTTP_X_SL_AUTH_TOKEN', 'HTTP_X-SL-AUTH-TOKEN'];
+  foreach ($keys as $k) {
+    if (!empty($_SERVER[$k])) return trim((string) $_SERVER[$k]);
+  }
+  foreach ($_SERVER as $k => $v) {
+    if (stripos($k, 'X_SL_AUTH_TOKEN') !== false || stripos($k, 'X-SL-AUTH-TOKEN') !== false) {
+      if (!empty($v)) return trim((string) $v);
+    }
+  }
+  if (!empty($_SERVER['HTTP_AUTHORIZATION']) && preg_match('/^Bearer\s+(\S+)$/i', $_SERVER['HTTP_AUTHORIZATION'], $m)) {
+    return trim($m[1]);
+  }
+  return null;
+}
+
+/**
+ * Umgeht rest_cookie_invalid_nonce wenn gültiger Token gesendet wird.
+ * Priority 25: nach dem Cookie-Check, damit wir den Fehler abfangen können.
+ */
+add_filter('rest_authentication_errors', function ($result) {
+  if (!is_wp_error($result) || $result->get_error_code() !== 'rest_cookie_invalid_nonce') {
+    return $result;
+  }
+  $token = sl_get_token_from_server();
+  if (!$token) return $result;
+  $uid = sl_validate_auth_token($token);
+  if ($uid <= 0) return $result;
+  wp_set_current_user($uid);
+  return true;
+}, 25);
+
 // ------------------------------
-// Handlers
+// Public handlers
 // ------------------------------
 
 function sl_whoami(WP_REST_Request $req) {
-  if (get_current_user_id() === 0) sl_ensure_current_user_from_cookie();
+  if (get_current_user_id() === 0) sl_ensure_current_user_from_cookie_or_token($req);
 
   $uid = (int)get_current_user_id();
   if ($uid <= 0) {
@@ -133,15 +273,20 @@ function sl_whoami(WP_REST_Request $req) {
 }
 
 function sl_nonce(WP_REST_Request $req) {
-  if (get_current_user_id() === 0) sl_ensure_current_user_from_cookie();
-
-  $logged_in = (get_current_user_id() > 0);
+  if (get_current_user_id() === 0) sl_ensure_current_user_from_cookie_or_token($req);
   return new WP_REST_Response([
     'ok'        => true,
-    'logged_in' => $logged_in,
+    'logged_in' => (get_current_user_id() > 0),
     'user_id'   => (int)get_current_user_id(),
     'nonce'     => wp_create_nonce('wp_rest'),
   ], 200);
+}
+
+function sl_auth_token(WP_REST_Request $req) {
+  $uid = (int) get_current_user_id();
+  if ($uid <= 0) return new WP_REST_Response(['ok' => false, 'error' => 'not_logged_in'], 401);
+  $data = sl_create_auth_token($uid);
+  return new WP_REST_Response(['ok' => true, 'token' => $data['token'], 'expires_in' => $data['expires_in']], 200);
 }
 
 function sl_logout(WP_REST_Request $req) {
@@ -149,42 +294,34 @@ function sl_logout(WP_REST_Request $req) {
   return new WP_REST_Response(['ok' => true], 200);
 }
 
-/**
- * GET /profile-v2
- * Assembles ProfileV2 from relational tables.
- */
+// ------------------------------
+// ProfileV2 transport (GET/POST)
+// ------------------------------
+
 function sl_profile_v2_get(WP_REST_Request $req) {
   global $wpdb;
 
   $uid  = (int)get_current_user_id();
   $year = (int)gmdate('Y');
 
-  // Tables (optional)
   $t_basic = $wpdb->prefix . 'sl_finance_basic';
   $t_pos   = $wpdb->prefix . 'sl_position';
-  $t_event = $wpdb->prefix . 'sl_event';
-  $t_line  = $wpdb->prefix . 'sl_event_line';
 
   $has_basic = sl_table_exists($t_basic);
   $has_pos   = sl_table_exists($t_pos);
-  $has_evt   = sl_table_exists($t_event) && sl_table_exists($t_line);
 
-  // Defaults (contract stability)
   $profile = [
     'household'    => ['persons' => []],
     'instruments'  => [],
-    'annuals'      => ['income' => [], 'need' => []], // indexation is optional
-    'events'       => [],
+    'annualsV2'    => ['income' => [], 'expense' => [], 'indexation' => 'inflation'],
+    'events'       => [], // now ProfileEvents shape
     'meta'         => [
       'startYear' => $year,
-      // default only; if DB has value -> overwritten below
       'forecastHorizonYears' => 55,
     ],
   ];
 
   if ($has_basic) {
-    // --- load horizon from DB (if column exists)
-    // If your table might not yet have the column in all envs, guard it:
     $cols = $wpdb->get_col("SHOW COLUMNS FROM {$t_basic}", 0);
     $has_horizon_col = is_array($cols) && in_array('forecast_horizon_years', $cols, true);
 
@@ -200,18 +337,19 @@ function sl_profile_v2_get(WP_REST_Request $req) {
     }
 
     $profile['household'] = sl_basic_load_household($uid, $t_basic);
-
-    // annuals includes optional indexation, sourced from sl_finance_basic.annuals_indexation
-    $profile['annuals'] = sl_annuals_load($uid, $t_basic, (int)$profile['meta']['startYear']);
+    $profile['annualsV2'] = sl_annuals_v2_load($uid, $t_basic, (int)$profile['meta']['startYear']);
   }
 
+  /*
   if ($has_pos) {
-    $profile['instruments'] = sl_positions_load_as_instruments($uid, $t_pos);
+    $profile['instruments'] = sl_positions_load_as_instruments_v3($uid, $t_pos);
+    // attach targetIds (IDs-only, relational)
+    sl_positions_attach_targets($uid, $profile['instruments']);
   }
+*/
 
-  if ($has_evt) {
-    $profile['events'] = sl_events_load($uid);
-  }
+  // ProfileEvents (new tables)
+  $profile['events'] = sl_profile_events_load($uid);
 
   return new WP_REST_Response([
     'ok'         => true,
@@ -220,18 +358,6 @@ function sl_profile_v2_get(WP_REST_Request $req) {
   ], 200);
 }
 
-/**
- * POST /profile-v2
- * Body: { "profile": { ...ProfileV2... } }
- *
- * Persists relationally (SoT):
- * - basic household/self -> sl_finance_basic (if exists)
- * - annuals (income/need + indexation) -> sl_finance_basic (if exists)
- * - instruments -> sl_position (if exists)
- * - events -> sl_event + sl_event_line (if exists)
- *
- * Returns freshly assembled profile from DB (ensures DB ids for events).
- */
 function sl_profile_v2_post(WP_REST_Request $req) {
   global $wpdb;
 
@@ -243,19 +369,14 @@ function sl_profile_v2_post(WP_REST_Request $req) {
     return new WP_REST_Response(['ok' => false, 'error' => 'invalid_payload'], 400);
   }
 
-  // Tables (optional)
-  $t_basic = $wpdb->prefix . 'sl_finance_basic';
-  $t_pos   = $wpdb->prefix . 'sl_position';
-  $t_event = $wpdb->prefix . 'sl_event';
-  $t_line  = $wpdb->prefix . 'sl_event_line';
+  $t_basic   = $wpdb->prefix . 'sl_finance_basic';
+  $t_pos     = $wpdb->prefix . 'sl_position';
 
   $has_basic = sl_table_exists($t_basic);
   $has_pos   = sl_table_exists($t_pos);
-  $has_evt   = sl_table_exists($t_event) && sl_table_exists($t_line);
 
   $now = current_time('mysql', 1);
 
-  // --- sanitize meta horizon (NO business rule like min=10; only safety)
   $meta = is_array($profile['meta'] ?? null) ? $profile['meta'] : [];
   $h = sl_sanitize_horizon_years($meta['forecastHorizonYears'] ?? null);
 
@@ -263,43 +384,163 @@ function sl_profile_v2_post(WP_REST_Request $req) {
 
   try {
     if ($has_basic) {
-      // Write basic + annuals
       sl_write_basic_from_profile_v2($uid, $profile, $t_basic, $now);
       sl_write_annuals_from_profile_v2($uid, $profile, $t_basic, $now);
 
-      // Persist horizon if column exists (and keep it optional for older DBs)
       $cols = $wpdb->get_col("SHOW COLUMNS FROM {$t_basic}", 0);
       $has_horizon_col = is_array($cols) && in_array('forecast_horizon_years', $cols, true);
-
       if ($has_horizon_col) {
-        // store NULL if not set; otherwise store sanitized int
-        $wpdb->update(
+        $ok = $wpdb->update(
           $t_basic,
-          ['forecast_horizon_years' => $h],
+          ['forecast_horizon_years' => $h, 'updated_at' => $now],
           ['user_id' => $uid],
-          ['%d'],
+          ['%d','%s'],
           ['%d']
         );
+        if ($ok === false) throw new Exception('horizon_update_failed');
       }
     }
 
+/*
     if ($has_pos) {
-      sl_write_positions_from_profile_v2($uid, $profile, $t_pos, $now);
+      // Replace-all: safe for rollout; you can move to per-instrument upsert later.
+      sl_positions_replace_from_profile_v2($uid, $profile, $t_pos, $now);
+      // Targets replace-all per instrument (IDs only)
+      sl_position_targets_replace_from_profile_v2($uid, $profile);
     }
+*/
 
-    if ($has_evt) {
-      $events = $profile['events'] ?? [];
-      sl_events_save($uid, $events); // MUST NOT start/commit its own transaction
-    }
+    // ProfileEvents replace-all (IDs only)
+    $events = $profile['events'] ?? [];
+    sl_profile_events_replace($uid, $events);
 
     $wpdb->query('COMMIT');
-
-    // return freshly loaded profile (ensures ids)
     return sl_profile_v2_get($req);
 
   } catch (Throwable $e) {
     $wpdb->query('ROLLBACK');
     return new WP_REST_Response(['ok' => false, 'error' => $e->getMessage()], 500);
+  }
+}
+
+// ------------------------------
+// New endpoints: Positions / Targets / ProfileEvents
+// ------------------------------
+
+function sl_positions_get(WP_REST_Request $req) {
+  global $wpdb;
+  $uid  = (int)get_current_user_id();
+  $t_pos = $wpdb->prefix . 'sl_position';
+  $positions = [];
+
+  if (sl_table_exists($t_pos)) {
+    // Ensure Liquidität and Schulden exist (is_system=1) before loading
+    sl_ensure_system_positions($uid, $t_pos);
+    $positions = sl_positions_load_as_instruments_v3($uid, $t_pos);
+    if (!empty($positions)) {
+      sl_positions_attach_targets($uid, $positions);
+    }
+  }
+
+  // Fallback when table missing
+  if (empty($positions)) {
+    $positions = sl_get_default_system_positions();
+  }
+
+  return new WP_REST_Response(['ok'=>true,'positions'=>$positions], 200);
+}
+
+function sl_positions_replace_post(WP_REST_Request $req) {
+
+  global $wpdb;
+  $uid  = (int)get_current_user_id();
+  $t_pos = $wpdb->prefix . 'sl_position';
+
+  if (!sl_table_exists($t_pos)) return new WP_REST_Response(['ok'=>false,'error'=>'table_missing'], 500);
+
+  $body = json_decode($req->get_body(), true);
+  $positions = $body['positions'] ?? null;
+  if (!is_array($positions)) return new WP_REST_Response(['ok'=>false,'error'=>'invalid_payload'], 400);
+
+  $now = current_time('mysql', 1);
+
+  $wpdb->query('START TRANSACTION');
+  try {
+    // Ensure system positions exist before replace
+    sl_ensure_system_positions($uid, $t_pos);
+
+    // delete user positions, but keep is_system=1 (Liquidität, Schulden)
+    if (sl_table_has_column($t_pos, 'is_system')) {
+      $del = $wpdb->query($wpdb->prepare(
+        "DELETE FROM {$t_pos} WHERE user_id=%d AND (is_system=0 OR is_system IS NULL)",
+        (int) $uid
+      ));
+    } else {
+      $del = $wpdb->delete($t_pos, ['user_id' => $uid]);
+    }
+    if ($del === false) throw new Exception('positions_delete_failed');
+
+    foreach ($positions as $ins) {
+      $inst_id = isset($ins['id']) ? trim((string)$ins['id']) : '';
+      $is_system_inst = ($inst_id === SL_SYSTEM_INSTRUMENT_LIQUIDITY || $inst_id === SL_SYSTEM_INSTRUMENT_DEBT);
+      if ($is_system_inst && sl_table_has_column($t_pos, 'is_system')) {
+        sl_position_update_from_payload($uid, $ins, $t_pos, $now);
+      } else {
+        sl_position_insert_v3($uid, $ins, $t_pos, $now);
+      }
+    }
+
+    // optional: targets in same call if provided
+    sl_position_targets_replace_from_positions_payload($uid, $positions);
+
+    $wpdb->query('COMMIT');
+
+    $out = sl_positions_load_as_instruments_v3($uid, $t_pos);
+    sl_positions_attach_targets($uid, $out);
+    return new WP_REST_Response(['ok'=>true,'positions'=>$out], 200);
+
+  } catch (Throwable $e) {
+    $wpdb->query('ROLLBACK');
+    return new WP_REST_Response(['ok'=>false,'error'=>$e->getMessage()], 500);
+  }
+}
+
+function sl_position_targets_set_post(WP_REST_Request $req) {
+  global $wpdb;
+  $uid = (int)get_current_user_id();
+
+  $body = json_decode($req->get_body(), true);
+  $from = isset($body['fromInstrumentId']) ? trim((string)$body['fromInstrumentId']) : '';
+  $targets = $body['targetIds'] ?? null;
+
+  if ($from === '' || !is_array($targets)) {
+    return new WP_REST_Response(['ok'=>false,'error'=>'invalid_payload'], 400);
+  }
+
+  sl_position_targets_set($uid, $from, $targets);
+  return new WP_REST_Response(['ok'=>true], 200);
+}
+
+function sl_profile_events_get(WP_REST_Request $req) {
+  $uid = (int)get_current_user_id();
+  return new WP_REST_Response(['ok'=>true,'events'=>sl_profile_events_load($uid)], 200);
+}
+
+function sl_profile_events_replace_post(WP_REST_Request $req) {
+  global $wpdb;
+  $uid = (int)get_current_user_id();
+  $body = json_decode($req->get_body(), true);
+  $events = $body['events'] ?? null;
+  if (!is_array($events)) return new WP_REST_Response(['ok'=>false,'error'=>'invalid_payload'], 400);
+
+  $wpdb->query('START TRANSACTION');
+  try {
+    sl_profile_events_replace($uid, $events);
+    $wpdb->query('COMMIT');
+    return new WP_REST_Response(['ok'=>true,'events'=>sl_profile_events_load($uid)], 200);
+  } catch (Throwable $e) {
+    $wpdb->query('ROLLBACK');
+    return new WP_REST_Response(['ok'=>false,'error'=>$e->getMessage()], 500);
   }
 }
 
@@ -315,7 +556,6 @@ function sl_basic_load_household($uid, $t_basic) {
     $uid
   ), ARRAY_A);
 
-  // Return at least "self" person if nothing exists (contract stability)
   if (!$row) {
     return [
       'persons' => [[
@@ -340,570 +580,1041 @@ function sl_basic_load_household($uid, $t_basic) {
   ];
 }
 
-/**
- * Expects ProfileV2 snippet:
- * profile.household.persons[0].birthDate (YYYY-MM-DD) OPTIONAL
- * profile.household.persons[0].retireAtAge            OPTIONAL
- */
 function sl_write_basic_from_profile_v2($user_id, $profile, $t_basic, $now) {
   global $wpdb;
 
   $p0 = $profile['household']['persons'][0] ?? [];
 
-  $birthDate = sl_norm_birth_date($p0['birthDate'] ?? null); // do NOT invent
+  $birthDate = sl_norm_birth_date($p0['birthDate'] ?? null);
   $retireAt  = (int)($p0['retireAtAge'] ?? 65);
 
-  $row = [
-    'user_id'       => (int)$user_id,
-    'birth_date'    => $birthDate, // NULL if not provided
+  $data = [
+    'birth_date'    => $birthDate,
     'retire_at_age' => ($retireAt > 0 ? $retireAt : 65),
     'updated_at'    => $now,
   ];
 
-  $updated = $wpdb->update($t_basic, $row, ['user_id' => (int)$user_id]);
+  $updated = $wpdb->update(
+    $t_basic,
+    $data,
+    ['user_id' => (int)$user_id],
+    ['%s','%d','%s'],
+    ['%d']
+  );
   if ($updated === false) throw new Exception('basic_update_failed');
 
-  if ($updated === 0) {
-    $ins = $wpdb->insert($t_basic, $row);
-    if ($ins === false) throw new Exception('basic_insert_failed');
-  }
-}
-
-// ------------------------------
-// Relational: ANNUALS (income/need/indexation)
-// ------------------------------
-/**
- * ProfileV2 transport:
- * profile.annuals = {
- *   indexation?: "inflation"|"fixed_real"|"fixed_nominal",
- *   income: AnnualItem[],
- *   need: AnnualItem[]
- * }
- *
- * DB:
- * - sl_finance_basic.annual_income_today (BIGINT)
- * - sl_finance_basic.annual_spending_today (BIGINT)
- * - sl_finance_basic.annuals_indexation (VARCHAR/ENUM)
- */
-function sl_annuals_load($uid, $t_basic, $startYear) {
-  global $wpdb;
-
-  $row = $wpdb->get_row($wpdb->prepare(
-    "SELECT annual_income_today, annual_spending_today, annuals_indexation
-     FROM {$t_basic} WHERE user_id=%d LIMIT 1",
-    (int)$uid
-  ), ARRAY_A);
-
-  // Always return indexation (default)
-  $idx = 'inflation';
-
-  if (!$row) {
-    return ['income' => [], 'need' => [], 'indexation' => $idx];
-  }
-
-  $incomeToday = isset($row['annual_income_today']) ? (int)$row['annual_income_today'] : 0;
-  $needToday   = isset($row['annual_spending_today']) ? (int)$row['annual_spending_today'] : 0;
-
-  if (isset($row['annuals_indexation'])) {
-    $v = trim((string)$row['annuals_indexation']);
-    if (in_array($v, ['inflation','fixed_real','fixed_nominal'], true)) $idx = $v;
-  }
-
-  $income = [];
-  $need = [];
-
-  if ($incomeToday > 0) {
-    $income[] = [
-      'id' => 'ui:annual:income_today',
-      'label' => 'Jahreseinkommen heute (UI)',
-      'amount' => (int)$incomeToday,
-      'startYear' => (int)$startYear,
-    ];
-  }
-
-  if ($needToday > 0) {
-    $need[] = [
-      'id' => 'ui:annual:need_today',
-      'label' => 'Jahresbedarf heute (UI)',
-      'amount' => (int)$needToday,
-      'startYear' => (int)$startYear,
-    ];
-  }
-
-  return ['income' => $income, 'need' => $need, 'indexation' => $idx];
-}
-
-/**
- * Expects ProfileV2 snippet:
- * profile.annuals.income[] (look for id="ui:annual:income_today")
- * profile.annuals.need[]   (look for id="ui:annual:need_today")
- * profile.annuals.indexation (optional)
- */
-
-function sl_write_annuals_from_profile_v2($user_id, $profile, $t_basic, $now) {
-  global $wpdb;
-
-  $annuals = $profile['annuals'] ?? null;
-  if (!is_array($annuals)) return;
-
-  $incomeItems = $annuals['income'] ?? [];
-  $needItems   = $annuals['need'] ?? [];
-
-  $incomeToday = 0;
-  foreach ($incomeItems as $it) {
-    if (!is_array($it)) continue;
-    if (($it['id'] ?? '') === 'ui:annual:income_today') {
-      $incomeToday = sl_norm_money_int($it['amount'] ?? 0);
-      break;
-    }
-  }
-
-  $needToday = 0;
-  foreach ($needItems as $it) {
-    if (!is_array($it)) continue;
-    if (($it['id'] ?? '') === 'ui:annual:need_today') {
-      $needToday = sl_norm_money_int($it['amount'] ?? 0);
-      break;
-    }
-  }
-
-  // Indexation comes from annuals.indexation and is persisted to sl_finance_basic.annuals_indexation
-  // IMPORTANT: Only write it if the client actually sent the key.
-  $idxToWrite = null;
-  $hasIdxKey = array_key_exists('indexation', $annuals);
-
-  if ($hasIdxKey) {
-    $idxToWrite = is_string($annuals['indexation']) ? trim((string)$annuals['indexation']) : '';
-    if ($idxToWrite === '') $idxToWrite = null;
-    if ($idxToWrite !== null && !in_array($idxToWrite, ['inflation','fixed_real','fixed_nominal'], true)) {
-      $idxToWrite = null;
-    }
-  }
-
-  // Build update row (only provided columns get updated)
-  $row = [
-    'annual_income_today'     => ($incomeToday > 0 ? (int)$incomeToday : null),
-    'annual_spending_today'   => ($needToday > 0 ? (int)$needToday : null),
-    'updated_at'              => $now,
-  ];
-
-  if ($hasIdxKey) {
-    $row['annuals_indexation'] = $idxToWrite; // may be NULL (explicit clear)
-  }
-
-  $ok = $wpdb->update($t_basic, $row, ['user_id' => (int)$user_id]);
-  if ($ok === false) throw new Exception('annuals_update_failed');
-
-  // update can be 0 although row exists (no change) -> do NOT insert blindly.
-  // Insert only if row does not exist.
   $exists = (int)$wpdb->get_var($wpdb->prepare(
     "SELECT COUNT(1) FROM {$t_basic} WHERE user_id=%d",
     (int)$user_id
   ));
 
   if ($exists === 0) {
-    $rowIns = array_merge(['user_id' => (int)$user_id], $row);
-    $ins = $wpdb->insert($t_basic, $rowIns);
+    $rowIns = array_merge(['user_id' => (int)$user_id], $data);
+    $ins = $wpdb->insert($t_basic, $rowIns, ['%d','%s','%d','%s']);
+    if ($ins === false) throw new Exception('basic_insert_failed');
+  }
+}
+
+// ------------------------------
+// Relational: ANNUALS V2
+// ------------------------------
+
+function sl_annuals_v2_load($uid, $t_basic, $startYear) {
+  global $wpdb;
+
+  $row = $wpdb->get_row($wpdb->prepare(
+    "SELECT
+        annual_income_today,
+        annual_income_destination,
+        annual_spending_today,
+        annual_spending_strategy,
+        annual_spending_source_1,
+        annual_spending_source_2,
+        min_liquidity_chf,
+        annuals_indexation
+     FROM {$t_basic}
+     WHERE user_id=%d
+     LIMIT 1",
+    (int)$uid
+  ), ARRAY_A);
+
+  if (!$row) {
+    return [
+      'income' => [],
+      'expense' => [],
+      'indexation' => 'inflation',
+    ];
+  }
+
+  $idx = 'inflation';
+  if (isset($row['annuals_indexation'])) {
+    $v = trim((string)$row['annuals_indexation']);
+    if (in_array($v, ['inflation','fixed_real','fixed_nominal'], true)) $idx = $v;
+  }
+
+  $incomeAmt = isset($row['annual_income_today']) ? (int)$row['annual_income_today'] : 0;
+  $needAmt   = isset($row['annual_spending_today']) ? (int)$row['annual_spending_today'] : 0;
+
+  $dest = null;
+  if (isset($row['annual_income_destination'])) {
+    $v = trim((string)$row['annual_income_destination']);
+    if ($v !== '') $dest = $v;
+  }
+
+  $strategy = null;
+  if (isset($row['annual_spending_strategy'])) {
+    $v = trim((string)$row['annual_spending_strategy']);
+    if ($v !== '') $strategy = $v;
+  }
+
+  $s1 = null;
+  if (isset($row['annual_spending_source_1'])) {
+    $v = trim((string)$row['annual_spending_source_1']);
+    if ($v !== '') $s1 = $v;
+  }
+
+  $s2 = null;
+  if (isset($row['annual_spending_source_2'])) {
+    $v = trim((string)$row['annual_spending_source_2']);
+    if ($v !== '') $s2 = $v;
+  }
+
+  $minLiq = 0;
+  if (array_key_exists('min_liquidity_chf', $row) && $row['min_liquidity_chf'] !== null) {
+    $minLiq = (int)$row['min_liquidity_chf'];
+    if ($minLiq < 0) $minLiq = 0;
+  }
+
+  $income = [];
+  if ($incomeAmt > 0 || $dest !== null) {
+    $income[] = [
+      'id' => 'ai_total',
+      'label' => 'Annual Income Total',
+      'amountCHF' => (int)$incomeAmt,
+      'destination' => $dest,
+    ];
+  }
+
+  $expense = [];
+  $fundingSources = [];
+  if ($s1 !== null) $fundingSources[] = ['source' => $s1];
+  if ($s2 !== null) $fundingSources[] = ['source' => $s2];
+
+  if ($needAmt > 0 || $strategy !== null || !empty($fundingSources) || $minLiq > 0) {
+    $expense[] = [
+      'id' => 'ae_total',
+      'label' => 'Annual Expense Total',
+      'amountCHF' => (int)$needAmt,
+      'fundingStrategy' => $strategy,
+      'fundingSources' => $fundingSources,
+      'minLiquidityCHF' => (int)$minLiq,
+    ];
+  }
+
+  return [
+    'income' => $income,
+    'expense' => $expense,
+    'indexation' => $idx,
+  ];
+}
+
+function sl_write_annuals_from_profile_v2($user_id, $profile, $t_basic, $now) {
+  global $wpdb;
+
+  $a = $profile['annualsV2'] ?? null;
+  if (!is_array($a)) return;
+
+  // ---- indexation (FIX: was missing in your version)
+  $hasIdxKey = array_key_exists('indexation', $a);
+  $idxToWrite = null;
+  if ($hasIdxKey) {
+    $v = is_string($a['indexation']) ? trim((string)$a['indexation']) : '';
+    if (in_array($v, ['inflation','fixed_real','fixed_nominal'], true)) $idxToWrite = $v;
+    else $idxToWrite = 'inflation';
+  }
+
+  // ---- Income total + destination
+  $incomeToday = null;
+  $incomeDest  = null;
+  $hasIncomeDestKey = false;
+
+  $incomeArr = $a['income'] ?? null;
+  if (is_array($incomeArr) && count($incomeArr) > 0 && is_array($incomeArr[0])) {
+    $it = $incomeArr[0];
+
+    if (array_key_exists('amountCHF', $it)) {
+      $n = sl_norm_money_int($it['amountCHF']);
+      $incomeToday = ($n > 0 ? $n : null);
+    }
+
+    if (array_key_exists('destination', $it)) {
+      $hasIncomeDestKey = true;
+      $v = is_string($it['destination']) ? trim((string)$it['destination']) : '';
+      $incomeDest = ($v !== '' ? $v : null);
+    }
+  }
+
+  // ---- Expense total + funding
+  $needToday = null;
+  $spStrategy = null;
+  $src1 = null;
+  $src2 = null;
+  $minLiq = null;
+
+  $hasSpStrategyKey = false;
+  $hasSpSourcesKey  = false;
+  $hasMinLiqKey     = false;
+
+  $expArr = $a['expense'] ?? null;
+  if (is_array($expArr) && count($expArr) > 0 && is_array($expArr[0])) {
+    $ex = $expArr[0];
+
+    if (array_key_exists('amountCHF', $ex)) {
+      $n = sl_norm_money_int($ex['amountCHF']);
+      $needToday = ($n > 0 ? $n : null);
+    }
+
+    if (array_key_exists('fundingStrategy', $ex)) {
+      $hasSpStrategyKey = true;
+      $v = is_string($ex['fundingStrategy']) ? trim((string)$ex['fundingStrategy']) : '';
+      $spStrategy = ($v !== '' ? $v : null);
+    }
+
+    if (array_key_exists('fundingSources', $ex) && is_array($ex['fundingSources'])) {
+      $hasSpSourcesKey = true;
+      $fs = $ex['fundingSources'];
+
+      $v1 = (is_array($fs[0] ?? null) && array_key_exists('source', $fs[0])) ? trim((string)$fs[0]['source']) : '';
+      $v2 = (is_array($fs[1] ?? null) && array_key_exists('source', $fs[1])) ? trim((string)$fs[1]['source']) : '';
+
+      $src1 = ($v1 !== '' ? $v1 : null);
+      $src2 = ($v2 !== '' ? $v2 : null);
+    }
+
+    if (array_key_exists('minLiquidityCHF', $ex)) {
+      $hasMinLiqKey = true;
+      $n = sl_norm_money_int($ex['minLiquidityCHF']);
+      $minLiq = ($n >= 0 ? $n : 0);
+    }
+  }
+
+  $data = ['updated_at' => $now];
+  $formats = ['%s'];
+
+  $data['annual_income_today']   = $incomeToday;
+  $data['annual_spending_today'] = $needToday;
+  $formats[] = '%d';
+  $formats[] = '%d';
+
+  if ($hasIdxKey) {
+    $data['annuals_indexation'] = $idxToWrite;
+    $formats[] = '%s';
+  }
+
+  if ($hasIncomeDestKey) {
+    $data['annual_income_destination'] = $incomeDest;
+    $formats[] = '%s';
+  }
+
+  if ($hasSpStrategyKey) {
+    $data['annual_spending_strategy'] = $spStrategy;
+    $formats[] = '%s';
+  }
+
+  if ($hasSpSourcesKey) {
+    $data['annual_spending_source_1'] = $src1;
+    $data['annual_spending_source_2'] = $src2;
+    $formats[] = '%s';
+    $formats[] = '%s';
+  }
+
+  if ($hasMinLiqKey) {
+    $data['min_liquidity_chf'] = $minLiq;
+    $formats[] = '%d';
+  }
+
+  $ok = $wpdb->update(
+    $t_basic,
+    $data,
+    ['user_id' => (int)$user_id],
+    $formats,
+    ['%d']
+  );
+  if ($ok === false) throw new Exception('annuals_update_failed');
+
+  $exists = (int)$wpdb->get_var($wpdb->prepare(
+    "SELECT COUNT(1) FROM {$t_basic} WHERE user_id=%d",
+    (int)$user_id
+  ));
+  if ($exists === 0) {
+    $rowIns = array_merge(['user_id' => (int)$user_id], $data);
+    $insFormats = array_merge(['%d'], $formats);
+    $ins = $wpdb->insert($t_basic, $rowIns, $insFormats);
     if ($ins === false) throw new Exception('annuals_insert_failed');
   }
 }
 
 // ------------------------------
-// Relational: POSITIONS (instruments)
+// Relational: POSITIONS (instruments) v3 + targets
 // ------------------------------
 
 /**
- * Writes instruments -> sl_position (replace strategy).
- *
- * Expects instruments like:
- * - asset: { id, kind:"asset", assetType, label, value }
- * - debt:  { id, kind:"debt",  debtType,  label, balance }
+ * System instrument IDs (cannot be deleted in GUI).
  */
-function sl_write_positions_from_profile_v2($user_id, $profile, $t_pos, $now) {
+define('SL_SYSTEM_INSTRUMENT_LIQUIDITY', 'liquidity');
+define('SL_SYSTEM_INSTRUMENT_DEBT', 'debt');
+
+/**
+ * Default system positions when user has none (fallback when table missing).
+ * Only Liquidität (active) and Schulden (passive, kurzfristig).
+ */
+function sl_get_default_system_positions() {
+  return [
+    [
+      'id' => SL_SYSTEM_INSTRUMENT_LIQUIDITY,
+      'kind' => 'asset',
+      'label' => 'Liquidität',
+      'bucket' => 'instant',
+      'assetType' => 'other',
+      'valueCHF' => 0,
+      'annualFlowCHF' => null,
+      'goal' => 'liq',
+      'note' => null,
+      'targetIds' => [],
+      'source_account_key' => null,
+      'target_account_key' => null,
+      'isSystem' => true,
+    ],
+    [
+      'id' => SL_SYSTEM_INSTRUMENT_DEBT,
+      'kind' => 'debt',
+      'label' => 'Schulden',
+      'bucket' => 'short',
+      'debtType' => 'other',
+      'valueCHF' => 0,
+      'annualFlowCHF' => null,
+      'note' => null,
+      'targetIds' => [],
+      'source_account_key' => null,
+      'target_account_key' => null,
+      'isSystem' => true,
+    ],
+  ];
+}
+
+/**
+ * Ensure is_system column exists in sl_position table.
+ */
+function sl_maybe_add_is_system_column($t_pos) {
+  if (sl_table_has_column($t_pos, 'is_system')) return;
+  global $wpdb;
+  $wpdb->query("ALTER TABLE {$t_pos} ADD COLUMN is_system TINYINT(1) NOT NULL DEFAULT 0");
+}
+
+/**
+ * Ensure system positions (Liquidität, Schulden) exist for user.
+ * Inserts them with is_system=1 if missing.
+ */
+function sl_ensure_system_positions($uid, $t_pos) {
   global $wpdb;
 
-  // Replace strategy (stable during buildout)
-  $del = $wpdb->delete($t_pos, ['user_id' => (int)$user_id]);
+  if (!sl_table_exists($t_pos)) return;
+  sl_maybe_add_is_system_column($t_pos);
+
+  $existing = $wpdb->get_col($wpdb->prepare(
+    "SELECT instrument_id FROM {$t_pos} WHERE user_id=%d AND instrument_id IN (%s, %s)",
+    (int) $uid,
+    SL_SYSTEM_INSTRUMENT_LIQUIDITY,
+    SL_SYSTEM_INSTRUMENT_DEBT
+  ));
+  $has_liquidity = in_array(SL_SYSTEM_INSTRUMENT_LIQUIDITY, (array)$existing, true);
+  $has_debt = in_array(SL_SYSTEM_INSTRUMENT_DEBT, (array)$existing, true);
+
+  $now = current_time('mysql', 1);
+
+  if (!$has_liquidity) {
+    sl_position_insert_system($uid, [
+      'id' => SL_SYSTEM_INSTRUMENT_LIQUIDITY,
+      'kind' => 'asset',
+      'label' => 'Liquidität',
+      'bucket' => 'instant',
+      'assetType' => 'other',
+      'valueCHF' => 0,
+    ], $t_pos, $now);
+  }
+  if (!$has_debt) {
+    sl_position_insert_system($uid, [
+      'id' => SL_SYSTEM_INSTRUMENT_DEBT,
+      'kind' => 'debt',
+      'label' => 'Schulden',
+      'bucket' => 'short',
+      'debtType' => 'other',
+      'valueCHF' => 0,
+    ], $t_pos, $now);
+  }
+}
+
+/**
+ * Insert a system position (is_system=1). Used for Liquidität and Schulden.
+ */
+function sl_position_insert_system($user_id, $ins, $t_pos, $now) {
+  sl_position_insert_v3($user_id, $ins, $t_pos, $now, true);
+}
+
+/**
+ * Update system position (Liquidität/Schulden) from payload. Preserves is_system=1.
+ */
+function sl_position_update_from_payload($user_id, $ins, $t_pos, $now) {
+  global $wpdb;
+
+  if (!is_array($ins)) return;
+  $instrument_id = isset($ins['id']) ? trim((string)$ins['id']) : '';
+  if ($instrument_id === '' || ($instrument_id !== SL_SYSTEM_INSTRUMENT_LIQUIDITY && $instrument_id !== SL_SYSTEM_INSTRUMENT_DEBT)) {
+    return;
+  }
+
+  $kind = isset($ins['kind']) ? strtolower(trim((string)$ins['kind'])) : '';
+  if ($kind !== 'asset' && $kind !== 'debt') return;
+
+  $label = sanitize_text_field($ins['label'] ?? ($instrument_id === SL_SYSTEM_INSTRUMENT_LIQUIDITY ? 'Liquidität' : 'Schulden'));
+  $availability = isset($ins['bucket']) ? trim((string)$ins['bucket']) : (isset($ins['availability']) ? trim((string)$ins['availability']) : null);
+  if ($availability === '') $availability = ($kind === 'asset' ? 'instant' : 'short');
+
+  $notes = isset($ins['note']) ? (string)$ins['note'] : (isset($ins['notes']) ? (string)$ins['notes'] : null);
+  $notes = ($notes !== null ? sanitize_text_field($notes) : null);
+  if ($notes === '') $notes = null;
+
+  $annualFlowCHF = null;
+  if (array_key_exists('annualFlowCHF', $ins)) $annualFlowCHF = (int) sl_norm_money_int($ins['annualFlowCHF']);
+  else if (array_key_exists('annualFlow', $ins)) $annualFlowCHF = (int) sl_norm_money_int($ins['annualFlow']);
+
+  $amount = 0;
+  if ($kind === 'asset') {
+    $amount = sl_norm_money_int($ins['valueCHF'] ?? ($ins['value'] ?? 0));
+  } else {
+    $amount = sl_norm_money_int($ins['valueCHF'] ?? ($ins['balance'] ?? 0));
+  }
+
+  $asset_type = ($kind === 'asset') ? sanitize_text_field($ins['assetType'] ?? ($ins['asset_type'] ?? 'other')) : 'other';
+  if ($asset_type === '') $asset_type = 'other';
+  $debt_type = ($kind === 'debt') ? sanitize_text_field($ins['debtType'] ?? ($ins['debt_type'] ?? 'other')) : 'other';
+  if ($debt_type === '') $debt_type = 'other';
+
+  $row = [
+    'label' => $label,
+    'amount_chf' => (int) $amount,
+    'availability' => $availability,
+    'cashflow_pa' => ($annualFlowCHF !== null ? (int) $annualFlowCHF : null),
+    'notes' => $notes,
+    'meta_json' => wp_json_encode(['notes' => ($notes ?? '')], JSON_UNESCAPED_UNICODE),
+    'updated_at' => $now,
+    'asset_type' => ($kind === 'asset' ? $asset_type : null),
+    'debt_type' => ($kind === 'debt' ? $debt_type : null),
+    'is_system' => 1,
+  ];
+
+  if ($kind === 'debt') {
+    $row['interest_rate_pct'] = array_key_exists('interestRatePct', $ins) ? sl_norm_percent($ins['interestRatePct']) : (array_key_exists('interestRate', $ins) ? sl_norm_percent($ins['interestRate']) : null);
+    $am = $ins['amortization'] ?? null;
+    $row['amortization_type'] = (is_array($am) ? sl_norm_amort_type($am['type'] ?? null) : 'none');
+    $row['amortization_pa_chf'] = null;
+    if (is_array($am) && array_key_exists('amountAnnualCHF', $am)) {
+      $n = sl_norm_money_int($am['amountAnnualCHF']);
+      $row['amortization_pa_chf'] = ($n > 0 ? $n : null);
+    }
+    if (sl_table_has_column($t_pos, 'amortization_source_instrument_id')) {
+      $row['amortization_source_instrument_id'] = (is_array($am) && !empty($am['sourceInstrumentId']) ? trim((string)$am['sourceInstrumentId']) : null);
+    }
+  } else {
+    $row['interest_rate_pct'] = null;
+    $row['amortization_type'] = 'none';
+    $row['amortization_pa_chf'] = null;
+    if (sl_table_has_column($t_pos, 'goal')) {
+      $g = isset($ins['goal']) ? strtolower(trim((string)$ins['goal'])) : 'liq';
+      $row['goal'] = ($g === 'reinvest' ? 'reinvest' : 'liq');
+    }
+  }
+
+  $exists = (int) $wpdb->get_var($wpdb->prepare(
+    "SELECT COUNT(1) FROM {$t_pos} WHERE user_id=%d AND instrument_id=%s",
+    (int) $user_id,
+    $instrument_id
+  ));
+  if ($exists === 0) {
+    sl_position_insert_system($user_id, $ins, $t_pos, $now);
+    return;
+  }
+
+  $ok = $wpdb->update($t_pos, $row, [
+    'user_id' => (int) $user_id,
+    'instrument_id' => $instrument_id,
+  ], null, ['%d', '%s']);
+  if ($ok === false) throw new Exception('position_update_failed');
+}
+
+function sl_positions_replace_from_profile_v2($user_id, $profile, $t_pos, $now) {
+  global $wpdb;
+
+  if (sl_table_has_column($t_pos, 'is_system')) {
+    $del = $wpdb->query($wpdb->prepare(
+      "DELETE FROM {$t_pos} WHERE user_id=%d AND (is_system=0 OR is_system IS NULL)",
+      (int) $user_id
+    ));
+  } else {
+    $del = $wpdb->delete($t_pos, ['user_id' => (int)$user_id]);
+  }
   if ($del === false) throw new Exception('positions_delete_failed');
 
   $instruments = $profile['instruments'] ?? [];
   if (!is_array($instruments)) $instruments = [];
 
+  sl_ensure_system_positions($user_id, $t_pos);
+
   foreach ($instruments as $ins) {
-    if (!is_array($ins)) continue;
-
-    $dir = sanitize_text_field($ins['kind'] ?? ''); // "asset" | "debt"
-    if ($dir === '') continue;
-
-    // Map type
-    $assetType = '';
-    $amount = 0;
-    if ($dir === 'asset') {
-      $assetType = sanitize_text_field($ins['assetType'] ?? '');
-      $amount    = sl_norm_money_int($ins['value'] ?? 0);
+    $inst_id = isset($ins['id']) ? trim((string)$ins['id']) : '';
+    $is_system_inst = ($inst_id === SL_SYSTEM_INSTRUMENT_LIQUIDITY || $inst_id === SL_SYSTEM_INSTRUMENT_DEBT);
+    if ($is_system_inst && sl_table_has_column($t_pos, 'is_system')) {
+      sl_position_update_from_payload($user_id, $ins, $t_pos, $now);
     } else {
-      $assetType = sanitize_text_field($ins['debtType'] ?? '');
-      $amount    = sl_norm_money_int($ins['balance'] ?? 0);
+      sl_position_insert_v3($user_id, $ins, $t_pos, $now);
+    }
+  }
+} 
+
+function sl_position_insert_v3($user_id, $ins, $t_pos, $now, $is_system = false) {
+  global $wpdb;
+
+  if (!is_array($ins)) return;
+
+  $kind = isset($ins['kind']) ? strtolower(trim((string)$ins['kind'])) : '';
+  if ($kind !== 'asset' && $kind !== 'debt') return;
+
+  // Stable instrument ID MUST be ins.id
+  $instrument_id = isset($ins['id']) ? trim((string)$ins['id']) : '';
+  if ($instrument_id === '') return;
+
+  $label = sanitize_text_field($ins['label'] ?? '');
+  if ($label === '') $label = ($kind === 'asset' ? 'Asset' : 'Debt');
+
+  $availability = isset($ins['bucket'])
+    ? trim((string)$ins['bucket'])
+    : (isset($ins['availability']) ? trim((string)$ins['availability']) : '');
+  if ($availability === '') $availability = null;
+
+  $notes = isset($ins['note']) ? (string)$ins['note'] : (isset($ins['notes']) ? (string)$ins['notes'] : null);
+  $notes = ($notes !== null ? sanitize_text_field($notes) : null);
+  if ($notes === '') $notes = null;
+
+  $annualFlowCHF = null;
+  if (array_key_exists('annualFlowCHF', $ins)) $annualFlowCHF = (int) sl_norm_money_int($ins['annualFlowCHF']);
+  else if (array_key_exists('annualFlow', $ins)) $annualFlowCHF = (int) sl_norm_money_int($ins['annualFlow']);
+  else if (array_key_exists('cashflow_pa', $ins)) $annualFlowCHF = (int) sl_norm_money_int($ins['cashflow_pa']);
+
+  // amount_chf: asset.valueCHF / debt.valueCHF or legacy value/balance
+  $amount = 0;
+  if ($kind === 'asset') {
+    $amount = sl_norm_money_int($ins['valueCHF'] ?? ($ins['value'] ?? 0));
+  } else {
+    $amount = sl_norm_money_int($ins['valueCHF'] ?? ($ins['balance'] ?? 0));
+  }
+
+  $asset_type = null;
+  $debt_type = null;
+
+  if ($kind === 'asset') {
+    $asset_type = sanitize_text_field($ins['assetType'] ?? ($ins['asset_type'] ?? 'other'));
+    if ($asset_type === '') $asset_type = 'other';
+  } else {
+    $debt_type = sanitize_text_field($ins['debtType'] ?? ($ins['debt_type'] ?? 'other'));
+    if ($debt_type === '') $debt_type = 'other';
+  }
+
+  $interest_rate_pct = null;
+  $amortization_type = 'none';
+  $amortization_pa_chf = null;
+  $amort_source_id = null;
+
+  if ($kind === 'debt') {
+    if (array_key_exists('interestRatePct', $ins)) $interest_rate_pct = sl_norm_percent($ins['interestRatePct']);
+    else if (array_key_exists('interestRate', $ins)) $interest_rate_pct = sl_norm_percent($ins['interestRate']);
+
+    $am = $ins['amortization'] ?? null;
+    if (is_array($am)) {
+      $amortization_type = sl_norm_amort_type($am['type'] ?? null);
+      if (array_key_exists('amountAnnualCHF', $am)) {
+        $n = sl_norm_money_int($am['amountAnnualCHF']);
+        $amortization_pa_chf = ($n > 0 ? $n : 0);
+      } else if (array_key_exists('amountAnnual', $am)) {
+        $n = sl_norm_money_int($am['amountAnnual']);
+        $amortization_pa_chf = ($n > 0 ? $n : 0);
+      }
+      if (array_key_exists('sourceInstrumentId', $am)) {
+        $v = trim((string)$am['sourceInstrumentId']);
+        $amort_source_id = ($v !== '' ? $v : null);
+      }
+    }
+  }
+
+  // --- NEW: goal (liq | reinvest) for assets
+  $goal = null;
+  if (array_key_exists('goal', $ins)) {
+    $v = strtolower(trim((string)$ins['goal']));
+    if ($v === 'liq' || $v === 'reinvest') $goal = $v;
+  }
+  // Default for assets (robust against old payloads)
+  if ($kind === 'asset' && $goal === null) $goal = 'liq';
+
+  // --- NEW: source_account_key / target_account_key (snake + camel support)
+  $source_account_key = null;
+  $target_account_key = null;
+
+  if (array_key_exists('source_account_key', $ins)) {
+    $v = trim((string)$ins['source_account_key']);
+    $source_account_key = ($v !== '' ? $v : null);
+  } else if (array_key_exists('sourceAccountKey', $ins)) {
+    $v = trim((string)$ins['sourceAccountKey']);
+    $source_account_key = ($v !== '' ? $v : null);
+  }
+
+  if (array_key_exists('target_account_key', $ins)) {
+    $v = trim((string)$ins['target_account_key']);
+    $target_account_key = ($v !== '' ? $v : null);
+  } else if (array_key_exists('targetAccountKey', $ins)) {
+    $v = trim((string)$ins['targetAccountKey']);
+    $target_account_key = ($v !== '' ? $v : null);
+  }
+
+  // Defensiv: source darf nie self sein. target darf self sein bei goal=reinvest.
+  if ($source_account_key !== null && $source_account_key === ('asset:' . $instrument_id)) {
+    $source_account_key = null;
+  }
+  if ($goal !== 'reinvest' && $target_account_key !== null && $target_account_key === ('asset:' . $instrument_id)) {
+    $target_account_key = null;
+  }
+
+  // meta_json: keep minimal
+  $meta_json = wp_json_encode(['notes' => ($notes ?? '')], JSON_UNESCAPED_UNICODE);
+
+  $row = [
+    'user_id'       => (int) $user_id,
+    'instrument_id' => $instrument_id,
+    'ui_id'         => $instrument_id, // keep equal for now
+    'kind'          => $kind . ':' . ($kind === 'asset' ? $asset_type : $debt_type),
+    'label'         => $label,
+    'amount_chf'    => (int) $amount,
+    'currency'      => 'CHF',
+    'availability'  => $availability,
+    'cashflow_pa'   => ($annualFlowCHF !== null ? (int) $annualFlowCHF : null),
+    'notes'         => $notes,
+    'meta_json'     => $meta_json,
+    'updated_at'    => $now,
+  ];
+
+  if ($kind === 'asset') {
+    $row['asset_type'] = $asset_type;
+    $row['debt_type']  = null;
+    $row['interest_rate_pct'] = null;
+    $row['amortization_type'] = 'none';
+    $row['amortization_pa_chf'] = null;
+
+    // new:
+    if (sl_table_has_column($t_pos, 'amortization_source_instrument_id')) {
+      $row['amortization_source_instrument_id'] = null;
+    }
+    if (sl_table_has_column($t_pos, 'source_account_key')) {
+      $row['source_account_key'] = $source_account_key;
+    }
+    if (sl_table_has_column($t_pos, 'target_account_key')) {
+      $row['target_account_key'] = $target_account_key;
+    }
+    if (sl_table_has_column($t_pos, 'goal')) {
+      $row['goal'] = $goal;
+    }
+    if (sl_table_has_column($t_pos, 'is_system')) {
+      $row['is_system'] = $is_system ? 1 : 0;
     }
 
-    $kind  = $dir . ':' . ($assetType !== '' ? $assetType : 'other');
-    $label = sanitize_text_field($ins['label'] ?? '');
+  } else {
+    $row['asset_type'] = null;
+    $row['debt_type']  = $debt_type;
+    $row['interest_rate_pct'] = $interest_rate_pct;
+    $row['amortization_type'] = $amortization_type;
+    $row['amortization_pa_chf'] = $amortization_pa_chf;
 
-    $is_liquid = 0;
-    if ($dir === 'asset' && in_array($assetType, ['cash', 'bank'], true)) $is_liquid = 1;
-
-    $meta = [
-      'instrument_id' => $ins['id'] ?? null,
-      'dir'           => $dir,
-      'assetType'     => ($assetType !== '' ? $assetType : null),
-    ];
-    $meta_json = wp_json_encode($meta, JSON_UNESCAPED_UNICODE);
-
-    $row = [
-      'user_id'    => (int)$user_id,
-      'kind'       => $kind,
-      'label'      => ($label !== '' ? $label : null),
-      'amount_chf' => (int)$amount,
-      'currency'   => 'CHF',
-      'is_liquid'  => (int)$is_liquid,
-      'meta_json'  => $meta_json,
-      'updated_at' => $now,
-    ];
-
-    $ok = $wpdb->insert($t_pos, $row);
-    if ($ok === false) throw new Exception('positions_insert_failed');
+    if (sl_table_has_column($t_pos, 'amortization_source_instrument_id')) {
+      $row['amortization_source_instrument_id'] = $amort_source_id;
+    }
+    if (sl_table_has_column($t_pos, 'source_account_key')) {
+      $row['source_account_key'] = $source_account_key;
+    }
+    if (sl_table_has_column($t_pos, 'target_account_key')) {
+      $row['target_account_key'] = $target_account_key;
+    }
+    if (sl_table_has_column($t_pos, 'is_system')) {
+      $row['is_system'] = $is_system ? 1 : 0;
+    }
+    // goal is ignored for debts (leave unset)
   }
+
+  $ok = $wpdb->insert($t_pos, $row);
+  if ($ok === false) throw new Exception('positions_insert_failed');
 }
 
-/**
- * Loads sl_position rows and maps back to ProfileV2.instruments[]
- * Uses meta_json where possible; falls back to splitting "kind" like "asset:cash".
- */
-function sl_positions_load_as_instruments($uid, $t_pos) {
+function sl_positions_load_as_instruments_v3($uid, $t_pos) {
   global $wpdb;
+
+  $has_amort_src = sl_table_has_column($t_pos, 'amortization_source_instrument_id');
+
+  $has_source_key = sl_table_has_column($t_pos, 'source_account_key');
+  $has_target_key = sl_table_has_column($t_pos, 'target_account_key');
+
+  // NEW: goal column (assets)
+  $has_goal = sl_table_has_column($t_pos, 'goal');
+
+  $has_is_system = sl_table_has_column($t_pos, 'is_system');
+
+  $select = "id, instrument_id, kind, label, amount_chf, availability, cashflow_pa, notes, asset_type, debt_type, interest_rate_pct, amortization_type, amortization_pa_chf";
+  if ($has_amort_src)  $select .= ", amortization_source_instrument_id";
+  if ($has_source_key) $select .= ", source_account_key";
+  if ($has_target_key) $select .= ", target_account_key";
+  if ($has_goal)       $select .= ", goal";
+  if ($has_is_system)  $select .= ", is_system";
 
   $rows = $wpdb->get_results($wpdb->prepare(
-    "SELECT kind, label, amount_chf, meta_json FROM {$t_pos} WHERE user_id=%d ORDER BY id ASC",
-    $uid
+    "SELECT {$select} FROM {$t_pos} WHERE user_id=%d ORDER BY id ASC",
+    (int)$uid
   ), ARRAY_A);
 
   if (!$rows) return [];
 
+  // error_log("sl_positions_load_as_instruments_v3: " . print_r($rows, true));
+
   $out = [];
+
   foreach ($rows as $r) {
-    $meta = $r['meta_json'] ? json_decode($r['meta_json'], true) : [];
-    $dir = $meta['dir'] ?? null;               // "asset" | "debt"
-    $type = $meta['assetType'] ?? null;        // cash/bank/... or other
-    $instrument_id = $meta['instrument_id'] ?? null;
+    $instrument_id = !empty($r['instrument_id']) ? (string)$r['instrument_id'] : null;
+    if (!$instrument_id) continue;
 
-    if (!$dir || !$type) {
-      $parts = explode(':', (string)($r['kind'] ?? ''));
-      $dir  = $dir ?: ($parts[0] ?? 'asset');
-      $type = $type ?: ($parts[1] ?? 'other');
+    $parts = explode(':', (string)($r['kind'] ?? ''));
+    $dir = $parts[0] ?? 'asset';
+    if ($dir !== 'asset' && $dir !== 'debt') $dir = 'asset';
+
+    $bucket = (isset($r['availability']) && $r['availability'] !== '') ? (string)$r['availability'] : null;
+    $annualFlow = ($r['cashflow_pa'] !== null && $r['cashflow_pa'] !== '') ? (int)$r['cashflow_pa'] : null;
+
+    // NEW: derive keys from row (only if columns exist)
+    $sourceKey = ($has_source_key && isset($r['source_account_key']) && $r['source_account_key'] !== '')
+      ? (string)$r['source_account_key']
+      : null;
+
+    $targetKey = ($has_target_key && isset($r['target_account_key']) && $r['target_account_key'] !== '')
+      ? (string)$r['target_account_key']
+      : null;
+
+    // NEW: goal (assets)
+    $goal = null;
+    if ($has_goal && isset($r['goal']) && $r['goal'] !== '') {
+      $g = strtolower(trim((string)$r['goal']));
+      if ($g === 'liq' || $g === 'reinvest') $goal = $g;
     }
+    if ($dir === 'asset' && $goal === null) $goal = 'liq';
 
-    $id = $instrument_id ?: ('pos:' . $dir . ':' . ($type ?: 'other'));
-    $label = $r['label'] ?: null;
-    $amt = intval($r['amount_chf'] ?? 0);
+    $isSystem = ($has_is_system && isset($r['is_system']) && (int)$r['is_system'] === 1);
 
     if ($dir === 'asset') {
       $out[] = [
-        'id' => $id,
+        'id' => $instrument_id,
         'kind' => 'asset',
-        'assetType' => $type ?: 'other',
-        'label' => $label ?: 'Asset',
-        'value' => $amt,
+        'label' => (string)($r['label'] ?? 'Asset'),
+        'bucket' => $bucket,
+        'assetType' => (string)($r['asset_type'] ?? 'other'),
+        'valueCHF' => (int)($r['amount_chf'] ?? 0),
+        'annualFlowCHF' => $annualFlow,
+
+        // NEW
+        'goal' => $goal,
+
+        'note' => (!empty($r['notes']) ? (string)$r['notes'] : null),
+        'targetIds' => [],
+        'source_account_key' => $sourceKey,
+        'target_account_key' => $targetKey,
+        'isSystem' => $isSystem,
       ];
-    } else {
-      $out[] = [
-        'id' => $id,
-        'kind' => 'debt',
-        'debtType' => $type ?: 'other',
-        'label' => $label ?: 'Debt',
-        'balance' => $amt,
-      ];
+      continue;
     }
+
+    $inst = [
+      'id' => $instrument_id,
+      'kind' => 'debt',
+      'label' => (string)($r['label'] ?? 'Debt'),
+      'bucket' => $bucket,
+      'debtType' => (string)($r['debt_type'] ?? 'other'),
+      'valueCHF' => (int)($r['amount_chf'] ?? 0),
+      'annualFlowCHF' => $annualFlow,
+      'note' => (!empty($r['notes']) ? (string)$r['notes'] : null),
+      'targetIds' => [],
+      'source_account_key' => $sourceKey,
+      'target_account_key' => $targetKey,
+      'isSystem' => $isSystem,
+    ];
+
+    if ($r['interest_rate_pct'] !== null && $r['interest_rate_pct'] !== '') {
+      $inst['interestRatePct'] = (float)$r['interest_rate_pct'];
+    }
+
+    $t = sl_norm_amort_type($r['amortization_type'] ?? 'none');
+    $a = ($r['amortization_pa_chf'] !== null && $r['amortization_pa_chf'] !== '') ? (int)$r['amortization_pa_chf'] : null;
+
+    if ($t !== 'none' || ($a !== null && $a > 0) || ($has_amort_src && !empty($r['amortization_source_instrument_id']))) {
+      $am = ['type' => ($t !== 'none' ? $t : 'direct')];
+      if ($a !== null && $a > 0) $am['amountAnnualCHF'] = $a;
+      if ($has_amort_src && !empty($r['amortization_source_instrument_id'])) {
+        $am['sourceInstrumentId'] = (string)$r['amortization_source_instrument_id'];
+      }
+      $inst['amortization'] = $am;
+    }
+
+    $out[] = $inst;
   }
 
   return $out;
 }
 
-// ------------------------------
-// Relational: EVENTS (sl_event + sl_event_line)
-// ------------------------------
-
-function sl_events_load($uid) {
+function sl_positions_attach_targets($uid, &$positions) {
   global $wpdb;
 
-  $t_event = $wpdb->prefix . 'sl_event';
-  $t_line  = $wpdb->prefix . 'sl_event_line';
+  $t = $wpdb->prefix . 'sl_position_target';
+  if (!sl_table_exists($t)) return;
+  if (!is_array($positions) || count($positions) === 0) return;
 
-  $sql = "
-    SELECT
-      e.id,
-      e.client_id,
-      e.title,
-      e.start_date,
-      e.end_date,
-      e.recurrence,
-      e.active,
-      e.meta_json,
-      l.id AS line_id,
-      l.line_type,
-      l.amount_chf,
-      l.indexation,
-      l.category,
-      l.meta_json AS line_meta_json
-    FROM {$t_event} e
-    JOIN {$t_line} l
-      ON l.event_id = e.id AND l.user_id = e.user_id
-    WHERE e.user_id = %d
-    ORDER BY e.start_date ASC, e.id ASC
-  ";
+  $byId = [];
+  foreach ($positions as $i => $p) {
+    if (is_array($p) && !empty($p['id'])) $byId[(string)$p['id']] = $i;
+  }
 
-  $rows = $wpdb->get_results($wpdb->prepare($sql, $uid), ARRAY_A);
-  if (!$rows) return [];
+  $rows = $wpdb->get_results($wpdb->prepare(
+    "SELECT from_instrument_id, to_instrument_id FROM {$t} WHERE user_id=%d",
+    (int)$uid
+  ), ARRAY_A);
 
-  $out = [];
+  if (!$rows) return;
+
   foreach ($rows as $r) {
-    $out[] = [
-      'id' => intval($r['id']),
-      'client_id' => $r['client_id'] ? (string)$r['client_id'] : null,
-      'title' => $r['title'],
-      'start_date' => $r['start_date'],
-      'end_date' => $r['end_date'] ? $r['end_date'] : null,
-      'recurrence' => $r['recurrence'],
-      'active' => intval($r['active']) ? 1 : 0,
-      'meta_json' => $r['meta_json'] ? json_decode($r['meta_json'], true) : null,
-      'line' => [
-        'id' => intval($r['line_id']),
-        'line_type' => $r['line_type'],
-        'amount_chf' => intval($r['amount_chf']),
-        'indexation' => $r['indexation'] ? $r['indexation'] : null,
-        'category' => $r['category'] ? $r['category'] : null,
-        'meta_json' => $r['line_meta_json'] ? json_decode($r['line_meta_json'], true) : null,
+    $from = (string)$r['from_instrument_id'];
+    $to   = (string)$r['to_instrument_id'];
+    if (!isset($byId[$from])) continue;
+    $idx = $byId[$from];
+    if (!isset($positions[$idx]['targetIds']) || !is_array($positions[$idx]['targetIds'])) {
+      $positions[$idx]['targetIds'] = [];
+    }
+    $positions[$idx]['targetIds'][] = $to;
+  }
+
+  // de-dupe
+  foreach ($positions as &$p) {
+    if (isset($p['targetIds']) && is_array($p['targetIds'])) {
+      $p['targetIds'] = array_values(array_unique(array_filter($p['targetIds'], fn($x)=>is_string($x) && trim($x)!=='')));
+    }
+  }
+}
+
+function sl_position_targets_replace_from_profile_v2($uid, $profile) {
+  $positions = $profile['instruments'] ?? [];
+  if (!is_array($positions)) $positions = [];
+  sl_position_targets_replace_from_positions_payload($uid, $positions);
+}
+
+function sl_position_targets_replace_from_positions_payload($uid, $positions) {
+  if (!is_array($positions)) return;
+  foreach ($positions as $p) {
+    if (!is_array($p)) continue;
+    $from = isset($p['id']) ? trim((string)$p['id']) : '';
+    if ($from === '') continue;
+    $targets = $p['targetIds'] ?? null;
+    if (is_array($targets)) sl_position_targets_set($uid, $from, $targets);
+  }
+}
+
+function sl_position_targets_set($uid, $fromInstrumentId, $targetIds) {
+  global $wpdb;
+
+  $t = $wpdb->prefix . 'sl_position_target';
+  if (!sl_table_exists($t)) return;
+
+  $from = trim((string)$fromInstrumentId);
+  if ($from === '') return;
+
+  $targets = array_values(array_unique(array_filter($targetIds, fn($x)=>is_string($x) && trim($x)!=='')));
+
+  $del = $wpdb->query($wpdb->prepare(
+    "DELETE FROM {$t} WHERE user_id=%d AND from_instrument_id=%s",
+    (int)$uid, $from
+  ));
+  if ($del === false) throw new Exception('position_targets_delete_failed');
+
+  foreach ($targets as $to) {
+    $ok = $wpdb->insert(
+      $t,
+      [
+        'user_id' => (int)$uid,
+        'from_instrument_id' => $from,
+        'to_instrument_id' => $to,
       ],
+      ['%d','%s','%s']
+    );
+    if ($ok === false) throw new Exception('position_targets_insert_failed');
+  }
+}
+
+// ------------------------------
+// Relational: ProfileEvents (sl_profile_event + sl_profile_event_line)
+// ------------------------------
+
+function sl_profile_events_load($uid) {
+  global $wpdb;
+
+  $t_e = $wpdb->prefix . 'sl_profile_event';
+  $t_l = $wpdb->prefix . 'sl_profile_event_line';
+
+  if (!sl_table_exists($t_e) || !sl_table_exists($t_l)) return [];
+
+  $events = $wpdb->get_results($wpdb->prepare(
+    "SELECT event_id, label, start_year, end_year, recurrence, event_type, note
+     FROM {$t_e}
+     WHERE user_id=%d
+     ORDER BY start_year ASC, id ASC",
+    (int)$uid
+  ), ARRAY_A);
+
+  if (!$events) return [];
+
+  $lines = $wpdb->get_results($wpdb->prepare(
+    "SELECT event_id, line_id, amount_chf, from_instrument_id, to_instrument_id, year, note
+     FROM {$t_l}
+     WHERE user_id=%d
+     ORDER BY id ASC",
+    (int)$uid
+  ), ARRAY_A);
+
+  $byEvent = [];
+  foreach ($events as $e) {
+    $eid = (string)$e['event_id'];
+    $byEvent[$eid] = [
+      'id' => $eid,
+      'label' => (string)$e['label'],
+      'startYear' => (int)$e['start_year'],
+      'endYear' => ($e['end_year'] !== null ? (int)$e['end_year'] : null),
+      'recurrence' => (string)$e['recurrence'], // once|yearly|monthly (monthly later)
+      'eventType' => ($e['event_type'] !== null ? (string)$e['event_type'] : null),
+      'note' => ($e['note'] !== null ? (string)$e['note'] : null),
+      'lines' => [],
     ];
   }
 
-  return $out;
+  foreach (($lines ?: []) as $l) {
+    $eid = (string)$l['event_id'];
+    if (!isset($byEvent[$eid])) continue;
+
+    $byEvent[$eid]['lines'][] = [
+      'id' => (string)$l['line_id'],
+      'amountCHF' => (int)$l['amount_chf'],
+      'fromInstrumentId' => (!empty($l['from_instrument_id']) ? (string)$l['from_instrument_id'] : null),
+      'toInstrumentId' => (!empty($l['to_instrument_id']) ? (string)$l['to_instrument_id'] : null),
+      'year' => ($l['year'] !== null ? (int)$l['year'] : null),
+      'note' => ($l['note'] !== null ? (string)$l['note'] : null),
+    ];
+  }
+
+  return array_values($byEvent);
 }
 
-/**
- * Saves events from ProfileV2.events[] into sl_event/sl_event_line.
- * Source-of-truth: payload list (upsert + delete missing).
- *
- * IMPORTANT:
- * - NO internal START/COMMIT/ROLLBACK here. The caller controls the transaction.
- */
-function sl_events_save($uid, $events) {
-
-  if ($events === null) return;        // <- kein "delete all" bei null
-  if (!is_array($events)) return;      // <- nur arbeiten, wenn wirklich Array
-
+function sl_profile_events_replace($uid, $events) {
   global $wpdb;
 
-  $t_event = $wpdb->prefix . 'sl_event';
-  $t_line  = $wpdb->prefix . 'sl_event_line';
+  $t_e = $wpdb->prefix . 'sl_profile_event';
+  $t_l = $wpdb->prefix . 'sl_profile_event_line';
 
-  if (!is_array($events)) $events = [];
+  if (!sl_table_exists($t_e) || !sl_table_exists($t_l)) return;
+  if ($events === null) return;
+  if (!is_array($events)) return;
 
-  // --- Existing in DB (both keys) ---
-  $existing = $wpdb->get_results($wpdb->prepare(
-    "SELECT id, client_id FROM {$t_event} WHERE user_id=%d",
-    $uid
-  ), ARRAY_A);
+  // replace-all per user
+  $ok1 = $wpdb->delete($t_l, ['user_id' => (int)$uid], ['%d']);
+  if ($ok1 === false) throw new Exception('profile_event_lines_delete_failed');
 
-  $existing_ids = [];
-  $existing_client_ids = [];
-  foreach (($existing ?: []) as $row) {
-    $existing_ids[] = intval($row['id']);
-    if (!empty($row['client_id'])) $existing_client_ids[] = (string)$row['client_id'];
-  }
-
-  // --- Payload keys ---
-  $payload_ids = [];
-  $payload_client_ids = [];
+  $ok2 = $wpdb->delete($t_e, ['user_id' => (int)$uid], ['%d']);
+  if ($ok2 === false) throw new Exception('profile_events_delete_failed');
 
   foreach ($events as $ev) {
     if (!is_array($ev)) continue;
 
-    $cid = isset($ev['client_id']) ? trim((string)$ev['client_id']) : '';
-    if ($cid !== '') $payload_client_ids[] = $cid;
+    $event_id = isset($ev['id']) ? trim((string)$ev['id']) : '';
+    $label = isset($ev['label']) ? trim((string)$ev['label']) : '';
+    $startYear = isset($ev['startYear']) ? (int)$ev['startYear'] : 0;
 
-    $id = isset($ev['id']) ? intval($ev['id']) : 0;
-    if ($id > 0) $payload_ids[] = $id;
-  }
+    if ($event_id === '' || $label === '' || $startYear <= 0) continue;
 
-  // --- Upsert ---
-  foreach ($events as $ev) {
-    if (!is_array($ev)) continue;
+    $endYear = (array_key_exists('endYear', $ev) && $ev['endYear'] !== null && $ev['endYear'] !== '') ? (int)$ev['endYear'] : null;
+    $rec = isset($ev['recurrence']) ? strtolower(trim((string)$ev['recurrence'])) : 'once';
+    if (!in_array($rec, ['once','yearly','monthly'], true)) $rec = 'once';
 
-    // keys
-    $client_id = isset($ev['client_id']) ? trim((string)$ev['client_id']) : '';
-    $id = isset($ev['id']) ? intval($ev['id']) : 0;
+    $eventType = (array_key_exists('eventType', $ev) && $ev['eventType'] !== null) ? trim((string)$ev['eventType']) : null;
+    if ($eventType === '') $eventType = null;
 
-    $title = trim((string)($ev['title'] ?? ''));
-    $start_date = (string)($ev['start_date'] ?? '');
-    $end_date = $ev['end_date'] ?? null;
-    $recurrence = (string)($ev['recurrence'] ?? 'none');
-    $active = isset($ev['active']) ? (intval($ev['active']) ? 1 : 0) : 1;
-    $meta_json = array_key_exists('meta_json', $ev) ? $ev['meta_json'] : null;
+    $note = (array_key_exists('note', $ev) && $ev['note'] !== null) ? trim((string)$ev['note']) : null;
+    if ($note === '') $note = null;
 
-    $line = $ev['line'] ?? null;
-    if (!$line || !is_array($line)) continue;
+    $ins = $wpdb->insert(
+      $t_e,
+      [
+        'user_id' => (int)$uid,
+        'event_id' => $event_id,
+        'label' => $label,
+        'start_year' => $startYear,
+        'end_year' => $endYear,
+        'recurrence' => $rec,
+        'event_type' => $eventType,
+        'note' => $note,
+      ],
+      ['%d','%s','%s','%d','%d','%s','%s','%s']
+    );
+    if ($ins === false) throw new Exception('profile_event_insert_failed');
 
-    $line_type = (string)($line['line_type'] ?? '');
-    $amount_chf = isset($line['amount_chf']) ? intval($line['amount_chf']) : 0;
-    $indexation = $line['indexation'] ?? null;
-    $category = $line['category'] ?? null;
-    $line_meta_json = array_key_exists('meta_json', $line) ? $line['meta_json'] : null;
+    $lines = $ev['lines'] ?? [];
+    if (!is_array($lines)) $lines = [];
 
-    // validation
-    if ($title === '') continue;
-    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $start_date)) continue;
+    foreach ($lines as $ln) {
+      if (!is_array($ln)) continue;
+      $line_id = isset($ln['id']) ? trim((string)$ln['id']) : '';
+      $amount = isset($ln['amountCHF']) ? (int)$ln['amountCHF'] : 0;
+      if ($line_id === '' || $amount <= 0) continue;
 
-    if ($end_date !== null && $end_date !== '' && !preg_match('/^\d{4}-\d{2}-\d{2}$/', (string)$end_date)) {
-      $end_date = null;
-    }
+      $from = (array_key_exists('fromInstrumentId', $ln) && $ln['fromInstrumentId'] !== null) ? trim((string)$ln['fromInstrumentId']) : null;
+      $to   = (array_key_exists('toInstrumentId', $ln) && $ln['toInstrumentId'] !== null) ? trim((string)$ln['toInstrumentId']) : null;
+      if ($from === '') $from = null;
+      if ($to === '') $to = null;
 
-    if (!in_array($recurrence, ['none','yearly','monthly'], true)) $recurrence = 'none';
-    if (!in_array($line_type, ['income','spending'], true)) continue;
-    if ($amount_chf <= 0) continue;
+      $year = (array_key_exists('year', $ln) && $ln['year'] !== null && $ln['year'] !== '') ? (int)$ln['year'] : null;
 
-    if ($indexation !== null && $indexation !== '' && !in_array($indexation, ['inflation','fixed_real','fixed_nominal'], true)) {
-      $indexation = null;
-    }
-
-    $meta_json_str = $meta_json !== null ? wp_json_encode($meta_json) : null;
-    $line_meta_json_str = $line_meta_json !== null ? wp_json_encode($line_meta_json) : null;
-
-    // --- resolve target event row ---
-    $event_id = 0;
-
-    if ($client_id !== '') {
-      // Preferred: stable UI key
-      $event_id = intval($wpdb->get_var($wpdb->prepare(
-        "SELECT id FROM {$t_event} WHERE user_id=%d AND client_id=%s",
-        $uid, $client_id
-      )));
-    } else if ($id > 0) {
-      // Legacy: numeric id must belong to user
-      $own = $wpdb->get_var($wpdb->prepare(
-        "SELECT COUNT(1) FROM {$t_event} WHERE id=%d AND user_id=%d",
-        $id, $uid
-      ));
-      if (intval($own) === 1) $event_id = $id;
-    }
-
-    // --- write event ---
-    if ($event_id > 0) {
-      // UPDATE
-      $data = [
-        'title' => $title,
-        'start_date' => $start_date,
-        'end_date' => ($end_date === '' ? null : $end_date),
-        'recurrence' => $recurrence,
-        'active' => $active,
-        'meta_json' => $meta_json_str,
-      ];
-      $format = ['%s','%s','%s','%s','%d','%s'];
-
-      if ($client_id !== '') {
-        $data['client_id'] = $client_id;
-        $format[] = '%s';
-      }
-
-      $ok = $wpdb->update(
-        $t_event,
-        $data,
-        ['id' => $event_id, 'user_id' => $uid],
-        $format,
-        ['%d','%d']
-      );
-      if ($ok === false) throw new Exception('event_update_failed');
-
-    } else {
-      // INSERT (requires client_id to prevent duplicates in UI use-cases)
-      if ($client_id === '') {
-        continue;
-      }
+      $ln_note = (array_key_exists('note', $ln) && $ln['note'] !== null) ? trim((string)$ln['note']) : null;
+      if ($ln_note === '') $ln_note = null;
 
       $ok = $wpdb->insert(
-        $t_event,
+        $t_l,
         [
-          'user_id' => $uid,
-          'client_id' => $client_id,
-          'title' => $title,
-          'start_date' => $start_date,
-          'end_date' => ($end_date === '' ? null : $end_date),
-          'recurrence' => $recurrence,
-          'active' => $active,
-          'meta_json' => $meta_json_str,
+          'user_id' => (int)$uid,
+          'event_id' => $event_id,
+          'line_id' => $line_id,
+          'amount_chf' => $amount,
+          'currency' => 'CHF',
+          'from_instrument_id' => $from,
+          'to_instrument_id' => $to,
+          'year' => $year,
+          'note' => $ln_note,
         ],
-        ['%d','%s','%s','%s','%s','%s','%d','%s']
+        ['%d','%s','%s','%d','%s','%s','%s','%d','%s']
       );
-      if ($ok === false) throw new Exception('event_insert_failed');
-
-      $event_id = intval($wpdb->insert_id);
-    }
-
-    // --- write line (1 line per event) ---
-    $okd = $wpdb->delete($t_line, ['event_id' => $event_id, 'user_id' => $uid], ['%d','%d']);
-    if ($okd === false) throw new Exception('event_line_delete_failed');
-
-    $ok2 = $wpdb->insert(
-      $t_line,
-      [
-        'event_id' => $event_id,
-        'user_id' => $uid,
-        'line_type' => $line_type,
-        'amount_chf' => $amount_chf,
-        'indexation' => ($indexation === '' ? null : $indexation),
-        'category' => ($category === '' ? null : $category),
-        'meta_json' => $line_meta_json_str,
-      ],
-      ['%d','%d','%s','%d','%s','%s','%s']
-    );
-    if ($ok2 === false) throw new Exception('event_line_insert_failed');
-  }
-
-  // --- Delete missing (source-of-truth) ---
-  $payload_client_ids = array_values(array_unique(array_filter($payload_client_ids, fn($x) => $x !== '')));
-  $payload_ids = array_values(array_unique(array_map('intval', $payload_ids)));
-
-  // 1) Delete by client_id
-  if (!empty($existing_client_ids)) {
-    if (empty($payload_client_ids)) {
-      $ok = $wpdb->query($wpdb->prepare(
-        "DELETE FROM {$t_event} WHERE user_id=%d AND client_id IS NOT NULL",
-        $uid
-      ));
-      if ($ok === false) throw new Exception('event_delete_failed');
-    } else {
-      $ph = implode(',', array_fill(0, count($payload_client_ids), '%s'));
-      $args = array_merge([$uid], $payload_client_ids);
-      $sql = "DELETE FROM {$t_event} WHERE user_id=%d AND client_id IS NOT NULL AND client_id NOT IN ($ph)";
-      $ok = $wpdb->query($wpdb->prepare($sql, ...$args));
-      if ($ok === false) throw new Exception('event_delete_failed');
-    }
-  }
-
-  // 2) Legacy delete by numeric id for rows where client_id is NULL
-  if (!empty($existing_ids)) {
-    $existing_legacy_ids = $wpdb->get_col($wpdb->prepare(
-      "SELECT id FROM {$t_event} WHERE user_id=%d AND (client_id IS NULL OR client_id='')",
-      $uid
-    ));
-    $existing_legacy_ids = array_map('intval', $existing_legacy_ids ?: []);
-
-    $to_delete = array_diff($existing_legacy_ids, $payload_ids);
-    if (!empty($to_delete)) {
-      $placeholders = implode(',', array_fill(0, count($to_delete), '%d'));
-      $args = array_merge([$uid], array_values($to_delete));
-      $sql = "DELETE FROM {$t_event} WHERE user_id=%d AND id IN ($placeholders)";
-      $ok = $wpdb->query($wpdb->prepare($sql, ...$args));
-      if ($ok === false) throw new Exception('event_delete_failed');
+      if ($ok === false) throw new Exception('profile_event_line_insert_failed');
     }
   }
 }
@@ -911,28 +1622,6 @@ function sl_events_save($uid, $events) {
 // ------------------------------
 // Helpers
 // ------------------------------
-
-function sl_norm_birth_date($v) {
-  if (!$v || !is_string($v)) return null;
-  if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $v)) return $v;
-  return null;
-}
-
-/**
- * Money norm:
- * - store as whole CHF integer (no cents)
- * - accept int/float or strings like "3'500", "3500", "3 500"
- */
-function sl_norm_money_int($v) {
-  if (is_int($v)) return $v;
-  if (is_float($v)) return (int)round($v);
-  if (!is_string($v)) return 0;
-
-  $s = str_replace(["'", " ", ","], "", $v);
-  $s = preg_replace('/\..*$/', '', $s);
-  if ($s === '' || !preg_match('/^-?\d+$/', $s)) return 0;
-  return (int)$s;
-}
 
 function sl_table_exists($table_name) {
   global $wpdb;
@@ -942,10 +1631,51 @@ function sl_table_exists($table_name) {
   return !empty($found);
 }
 
+function sl_table_has_column($table, $col) {
+  global $wpdb;
+  $existing = $wpdb->get_col("SHOW COLUMNS FROM {$table}", 0);
+  return is_array($existing) && in_array($col, $existing, true);
+}
+
+function sl_norm_percent($v) {
+  if ($v === null) return null;
+  if (is_int($v) || is_float($v)) return (float)$v;
+  if (!is_string($v)) return null;
+  $s = trim($v);
+  if ($s === '') return null;
+  $s = str_replace(',', '.', $s);
+  if (!is_numeric($s)) return null;
+  return (float)$s;
+}
+
+function sl_norm_amort_type($v) {
+  $s = is_string($v) ? strtolower(trim($v)) : '';
+  if (in_array($s, ['none','direct','indirect'], true)) return $s;
+  return 'none';
+}
+
+function sl_norm_birth_date($v) {
+  if (!$v || !is_string($v)) return null;
+  if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $v)) return $v;
+  return null;
+}
+
+function sl_norm_money_int($v) {
+  if (is_int($v)) return $v;
+  if (is_float($v)) return (int)round($v);
+  if (is_numeric($v)) return (int)round((float)$v);
+  if (!is_string($v)) return 0;
+
+  $s = str_replace(["'", " ", ","], "", $v);
+  $s = preg_replace('/\..*$/', '', $s);
+  if ($s === '' || !preg_match('/^-?\d+$/', $s)) return 0;
+  return (int)$s;
+}
+
 function sl_sanitize_horizon_years($v) {
   if (!isset($v)) return null;
   $n = (int)$v;
   if ($n <= 0) return null;
-  if ($n > 120) $n = 120; // safety only
+  if ($n > 120) $n = 120;
   return $n;
 }
